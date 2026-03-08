@@ -51,7 +51,7 @@ if __name__ == "__main__":
     config["value_column"] = "OT"
     # Funnel pipeline: MCTS (L1-L3) -> Candidate Pool -> Tuning -> Ensemble
     config["use_funnel_pipeline"] = True
-    config["funnel_num_slices"] = 1  # 试跑先用 1 个 slice；可改为 None 跑全部
+    config["funnel_num_slices"] = 25  # 试跑先用 1 个 slice；可改为 None 跑全部
 
     # 启用 verbose 进度打印
     set_verbose(config.get("verbose", False))

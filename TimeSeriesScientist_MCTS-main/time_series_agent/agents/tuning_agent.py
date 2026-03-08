@@ -334,26 +334,49 @@ Output only one JSON object: keys = model names, values = hyperparameter dicts. 
         try:
             msg = self.llm.invoke([HumanMessage(content=prompt)])
             text = getattr(msg, "content", "") or str(msg)
+
+            # Hard cap to avoid pathological long outputs slowing parsing/logging
+            text = str(text)
+            if len(text) > 20000:
+                text = text[:20000]
+
             # strip markdown code block if present
             if "```" in text:
                 for part in text.split("```"):
-                    if part.strip().startswith("{"):
-                        text = part.strip()
+                    part_s = part.strip()
+                    if part_s.startswith("{"):
+                        text = part_s
                         break
+
             obj = _extract_json(text)
+
+            # ---- MOD 2: if not valid JSON, return defaults immediately (no extra work) ----
             if not obj:
-                vprint("LLM", "Fast sim suggestion: no valid JSON returned, using defaults")
+                vprint("LLM", "Fast sim suggestion: no valid JSON returned; using defaults")
+                # defaults: return empty params per model (fast + safe)
                 return {m: {} for m in models}
+
             out = {}
             for m in models:
-                out[m] = obj.get(m, {})
-                if m in ("LSTM", "NeuralNetwork", "Transformer") and "epochs" in out[m]:
-                    out[m]["epochs"] = min(int(out[m]["epochs"]), max_epochs)
-            vprint("LLM", "Fast sim suggestion result: %s", out)
+                m_cfg = obj.get(m, {})
+                if not isinstance(m_cfg, dict):
+                    m_cfg = {}
+                # cap epochs for deep models
+                if m in ("LSTM", "NeuralNetwork", "Transformer") and "epochs" in m_cfg:
+                    try:
+                        m_cfg["epochs"] = min(int(m_cfg["epochs"]), max_epochs)
+                    except Exception:
+                        # if epochs is not parseable, drop it
+                        m_cfg.pop("epochs", None)
+                out[m] = m_cfg
+
+            # Avoid printing huge dicts that can freeze the console
+            vprint("LLM", "Fast sim suggestion result (trunc): %s", str(out)[:300])
             return out
+
         except Exception as e:
             logger.warning(f"suggest_params_for_fast_sim failed: {e}")
-            vprint("LLM", "Fast sim suggestion FAILED: %s", e)
+            vprint("LLM", "Fast sim suggestion FAILED: %s", str(e)[:300])
             return {m: {} for m in models}
 
     def _create_tools(self, ctx: TuningContext):

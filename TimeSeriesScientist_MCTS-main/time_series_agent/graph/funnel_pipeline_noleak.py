@@ -1303,37 +1303,29 @@ def _plot_all_mcts_trees(
 def _aggregate_slice_results(
     slice_results: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Plain mean across slices (NO filtering by error, NO dropping NaN)."""
-    # Include ALL slices that have test_metrics, even if r["error"] is True.
-    used = [r for r in slice_results if isinstance(r.get("test_metrics"), dict)]
-    if not used:
-        return {"test_metrics": {}, "num_slices": 0, "aggregation_method": "plain_mean_all"}
+    """Average test metrics across slices."""
+    valid = [r for r in slice_results if "test_metrics" in r and not r.get("error")]
+    if not valid:
+        return {"test_metrics": {}, "num_slices": 0, "aggregation_method": "mean"}
 
     all_keys: set = set()
-    for r in used:
+    for r in valid:
         all_keys.update(r["test_metrics"].keys())
 
     aggregated_metrics: Dict[str, Dict[str, float]] = {}
     for key in sorted(all_keys):
-        key_metrics = [r["test_metrics"][key] for r in used if key in r["test_metrics"]]
-        if not key_metrics:
-            continue
-
-        # "Normal" mean: include large values; if there are NaNs, numpy mean will return NaN.
-        mses = np.asarray([m.get("mse", float("nan")) for m in key_metrics], dtype=float)
-        maes = np.asarray([m.get("mae", float("nan")) for m in key_metrics], dtype=float)
-        mapes = np.asarray([m.get("mape", float("nan")) for m in key_metrics], dtype=float)
-
-        aggregated_metrics[key] = {
-            "mse": float(np.mean(mses)),
-            "mae": float(np.mean(maes)),
-            "mape": float(np.mean(mapes)),
-        }
+        key_metrics = [r["test_metrics"][key] for r in valid if key in r["test_metrics"]]
+        if key_metrics:
+            aggregated_metrics[key] = {
+                "mse": float(np.mean([m["mse"] for m in key_metrics if not np.isnan(m["mse"])] or [float("nan")])),
+                "mae": float(np.mean([m["mae"] for m in key_metrics if not np.isnan(m["mae"])] or [float("nan")])),
+                "mape": float(np.mean([m["mape"] for m in key_metrics if not np.isnan(m["mape"])] or [float("nan")])),
+            }
 
     return {
         "test_metrics": aggregated_metrics,
-        "num_slices": len(used),
-        "aggregation_method": "plain_mean_all",
+        "num_slices": len(valid),
+        "aggregation_method": "mean",
     }
 
 
