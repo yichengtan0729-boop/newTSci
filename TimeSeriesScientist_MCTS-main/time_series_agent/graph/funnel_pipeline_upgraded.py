@@ -101,16 +101,6 @@ def _metrics_from_pred(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, floa
 
     return {"mse": mse, "mae": mae, "mape": mape}
 
-def _safe_align_to_len(x, target_len: int):
-    """Align by truncation only. If shorter than target_len, return None.
-    Do NOT use np.resize here, because it repeats values and can distort metrics.
-    """
-    arr = np.asarray(x, dtype=float).flatten()
-    if len(arr) == target_len:
-        return arr
-    if len(arr) > target_len:
-        return arr[:target_len]
-    return None
 
 def _default_apply_preprocess(data: Any, params: Dict[str, Any]) -> Any:
     """L1 preprocessing with train-only fit for statistics (no leakage).
