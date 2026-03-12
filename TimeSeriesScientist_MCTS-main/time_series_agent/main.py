@@ -41,7 +41,7 @@ if __name__ == "__main__":
     # 1. Create and customize config
     config = DEFAULT_CONFIG.copy()
     # Example customizations (edit as needed):
-    config["num_slices"] = 25
+    config["num_slices"] = 1
     config["input_length"] = 512
     config["horizon"] = 96
     config["data_path"] = "dataset/ETTh1.csv"
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     config["value_column"] = "OT"
     # Funnel pipeline: MCTS (L1-L3) -> Candidate Pool -> Tuning -> Ensemble
     config["use_funnel_pipeline"] = True
-    config["funnel_num_slices"] = 25  # 试跑先用 1 个 slice；可改为 None 跑全部
+    config["funnel_num_slices"] = 1  # 试跑先用 1 个 slice；可改为 None 跑全部
     config["ensemble_method"] = "auto"
     config["enable_test_guard"] = True
     # 启用 verbose 进度打印

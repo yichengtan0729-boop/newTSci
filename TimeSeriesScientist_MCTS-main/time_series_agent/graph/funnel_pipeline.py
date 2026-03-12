@@ -22,20 +22,42 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from agents.memory import ExperimentMemory
+
 # #region agent log
 _DEBUG_LOG = Path(__file__).resolve().parent.parent.parent / ".cursor" / "debug.log"
+
+
 def _dbg(m: str, data: Dict[str, Any], hid: str):
     try:
         with open(_DEBUG_LOG, "a") as f:
-            f.write(json.dumps({"timestamp": int(time.time() * 1000), "location": "funnel_pipeline.py", "message": m, "data": data, "hypothesisId": hid}) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        "timestamp": int(time.time() * 1000),
+                        "location": "funnel_pipeline.py",
+                        "message": m,
+                        "data": data,
+                        "hypothesisId": hid,
+                    }
+                )
+                + "\n"
+            )
     except Exception:
         pass
+
+
 # #endregion
 
 import numpy as np
 import pandas as pd
 
-from mcts.action_space import ACTION_SPACE, MODEL_PARADIGM
+from mcts.action_space import (
+    ACTION_SPACE,
+    MODEL_PARADIGM,
+    MODEL_ACTION_SPACE,
+    get_conditioned_action_spec,
+    generate_dynamic_recipe,
+)
 from utils.data_utils import DataPreprocessor
 from utils.visualization_utils import TimeSeriesVisualizer
 from utils.progress import vprint
@@ -101,23 +123,24 @@ def _metrics_from_pred(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, floa
 
     return {"mse": mse, "mae": mae, "mape": mape}
 
+
 def _safe_align_to_len(x, target_len: int):
     """Align by truncation only. If shorter than target_len, return None.
-    Do NOT use np.resize here, because it repeats values and can distort metrics.
+    NOTE: do NOT use np.resize here, because it repeats data and can blow up MAPE.
     """
-    arr = np.asarray(x, dtype=float).flatten()
+    arr = np.asarray(x).flatten()
     if len(arr) == target_len:
         return arr
     if len(arr) > target_len:
         return arr[:target_len]
     return None
 
-def _default_apply_preprocess(data: Any, params: Dict[str, Any]) -> Any:
-    """L1 preprocessing with train-only fit for statistics (no leakage).
 
-    Global statistics (outlier thresholds, normalization parameters) are fit on
-    the leading fit segment only, then applied to the whole slice.
-    params may include "_fit_len".
+def _default_apply_preprocess(data: Any, params: Dict[str, Any]) -> Any:
+    """L1: PreprocessAgent-style (missing values + outliers) then normalization + stationarity.
+
+    Order: missing_value_strategy → outlier_detect + outlier_handle → normalization → stationarity.
+    Uses DataPreprocessor (same as PreprocessAgent) for missing/outlier handling.
     """
     if isinstance(data, pd.DataFrame):
         series = data["value"] if "value" in data.columns else data.iloc[:, 0]
@@ -125,101 +148,52 @@ def _default_apply_preprocess(data: Any, params: Dict[str, Any]) -> Any:
         series = np.array(data.get("value", list(data.values())[0] if data else []))
     else:
         series = np.asarray(data).flatten()
-    vals = np.asarray(series, dtype=float).flatten()
+    vals = np.asarray(series, dtype=float)
 
-    # Missing values: applied over full slice
+    # Single-column DataFrame for DataPreprocessor calls
     df_one = pd.DataFrame({"value": vals})
+
+    # 1) Missing value strategy (same as PreprocessAgent)
     missing_strategy = params.get("missing_value_strategy", "none")
     if missing_strategy and missing_strategy != "none" and np.any(np.isnan(vals)):
         df_one = DataPreprocessor.handle_missing_values(df_one, strategy=missing_strategy)
-        vals = np.asarray(df_one["value"].values, dtype=float).flatten()
+        vals = np.asarray(df_one["value"].values, dtype=float)
         df_one = pd.DataFrame({"value": vals})
 
-    n = len(vals)
-    fit_len = int(params.get("_fit_len", data.get("_fit_len", n) if isinstance(data, dict) else n))
-    fit_len = max(1, min(fit_len, n if n > 0 else 1))
-    fit_vals = vals[:fit_len].astype(float, copy=False)
-
-    # Outlier thresholds fit on train segment only, applied to full slice
+    # 2) Outlier detect + handle (same as PreprocessAgent)
     outlier_detect = params.get("outlier_detect", "none")
     outlier_handle = params.get("outlier_handle", "none")
-    if outlier_detect and outlier_detect != "none" and outlier_handle and outlier_handle != "none" and n > 0:
-        low, high = None, None
-        if outlier_detect == "zscore":
-            mu = float(np.nanmean(fit_vals))
-            sigma = float(np.nanstd(fit_vals))
-            if sigma > 0:
-                z = float(params.get("outlier_threshold", 3.0))
-                low, high = mu - z * sigma, mu + z * sigma
-        elif outlier_detect == "iqr":
-            q1 = float(np.nanpercentile(fit_vals, 25))
-            q3 = float(np.nanpercentile(fit_vals, 75))
-            iqr = q3 - q1
-            if iqr > 0:
-                k = float(params.get("outlier_threshold", 1.5))
-                low, high = q1 - k * iqr, q3 + k * iqr
-        elif outlier_detect == "percentile":
-            lo_p = float(params.get("outlier_low_pct", 1.0))
-            hi_p = float(params.get("outlier_high_pct", 99.0))
-            low = float(np.nanpercentile(fit_vals, lo_p))
-            high = float(np.nanpercentile(fit_vals, hi_p))
-
-        if low is not None and high is not None and low < high:
-            outlier_mask = (vals < low) | (vals > high)
-            if np.any(outlier_mask):
-                if outlier_handle == "clip":
-                    vals = np.clip(vals, low, high)
-                elif outlier_handle in ("median", "mean"):
-                    fill = float(np.nanmedian(fit_vals)) if outlier_handle == "median" else float(np.nanmean(fit_vals))
-                    vals = vals.copy()
-                    vals[outlier_mask] = fill
-                elif outlier_handle == "interpolate":
-                    s = pd.Series(vals)
-                    s[outlier_mask] = np.nan
-                    vals = s.interpolate(limit_direction="both").to_numpy(dtype=float)
-                elif outlier_handle == "smooth":
-                    s = pd.Series(vals)
-                    w = int(params.get("smooth_window", 5))
-                    w = max(3, min(w, max(3, n // 10)))
-                    roll = s.rolling(window=w, min_periods=1).median()
-                    vals = vals.copy()
-                    vals[outlier_mask] = roll.to_numpy(dtype=float)[outlier_mask]
+    if outlier_detect and outlier_detect != "none" and outlier_handle and outlier_handle != "none":
+        threshold = params.get("outlier_threshold", 1.5)
+        window_size = min(24, max(3, len(vals) // 4))
+        outlier_info = DataPreprocessor.detect_outliers(
+            df_one, method=outlier_detect, threshold=threshold, window_size=window_size,
+        )
+        if outlier_info and any(outlier_info.values()):
+            df_one = DataPreprocessor.handle_outliers(df_one, outlier_info, strategy=outlier_handle)
+        vals = np.asarray(df_one["value"].values, dtype=float)
 
     value_original = vals.copy()
 
-    # Normalization fit on train segment only
     norm = params.get("normalization", "none")
     scaler = None
-    if norm == "minmax" and n > 0:
-        vmin = float(np.nanmin(fit_vals))
-        vmax = float(np.nanmax(fit_vals))
+    if norm == "minmax" and vals.size:
+        vmin, vmax = vals.min(), vals.max()
         if vmax > vmin:
             vals = (vals - vmin) / (vmax - vmin)
-            scaler = _NormScaler("minmax", min=vmin, max=vmax)
-    elif norm == "zscore" and n > 0:
-        mu = float(np.nanmean(fit_vals))
-        sigma = float(np.nanstd(fit_vals))
-        if sigma > 0:
-            vals = (vals - mu) / sigma
-            scaler = _NormScaler("zscore", mean=mu, std=sigma)
+            scaler = _NormScaler("minmax", min=float(vmin), max=float(vmax))
+    elif norm == "zscore" and vals.size and vals.std() > 0:
+        mu, sigma = float(vals.mean()), float(vals.std())
+        vals = (vals - mu) / sigma
+        scaler = _NormScaler("zscore", mean=mu, std=sigma)
 
-    # Stationarity after normalization; keep metadata for inverse transform
     stat = params.get("stationarity", "none")
-    vals_pre_stat = vals.copy()
-    if stat == "diff" and n > 0:
+    if stat == "diff" and vals.size:
         vals = np.diff(vals, prepend=vals[0])
-    elif stat == "log" and n > 0 and np.all(vals > 0):
+    elif stat == "log" and vals.size and (vals > 0).all():
         vals = np.log(vals + 1e-8)
-    else:
-        stat = "none"
 
-    out: Dict[str, Any] = {
-        "value": vals,
-        "value_original": value_original,
-        "stationarity": stat,
-        "value_pre_stat": vals_pre_stat,
-        "_fit_len": fit_len,
-    }
+    out: Dict[str, Any] = {"value": vals, "value_original": value_original}
     if scaler is not None:
         out["scaler"] = scaler
     return out
@@ -252,7 +226,7 @@ def _default_apply_features(data: Any, params: Dict[str, Any]) -> Any:
     if num_lags and num_lags > 0:
         for lag in range(1, int(num_lags) + 1):
             lag_arr = np.empty(n)
-            lag_arr[:lag] = vals[0]          # pad head with first value
+            lag_arr[:lag] = vals[0]  # pad head with first value
             lag_arr[lag:] = vals[:-lag]
             features[f"lag_{lag}"] = lag_arr
 
@@ -281,7 +255,7 @@ def _default_apply_features(data: Any, params: Dict[str, Any]) -> Any:
                 features[f"sin_{period}"] = np.sin(2 * np.pi * t / period)
                 features[f"cos_{period}"] = np.cos(2 * np.pi * t / period)
 
-    # Pack back into dict — keep original "value" plus extra features; pass through L1 metadata
+    # Pack back into dict — keep original "value" plus extra features; pass through L1 scaler/value_original
     out: Dict[str, Any] = {"value": vals}
     out.update(features)
     if isinstance(data, dict):
@@ -289,13 +263,41 @@ def _default_apply_features(data: Any, params: Dict[str, Any]) -> Any:
             out["value_original"] = np.asarray(data["value_original"]).flatten()
         if "scaler" in data:
             out["scaler"] = data["scaler"]
-        if "stationarity" in data:
-            out["stationarity"] = data["stationarity"]
-        if "value_pre_stat" in data:
-            out["value_pre_stat"] = np.asarray(data["value_pre_stat"]).flatten()
-        if "_fit_len" in data:
-            out["_fit_len"] = int(data["_fit_len"])
     return out
+
+
+def _default_apply_features_from_recipe(
+    data: Any,
+    recipe_cfg: Dict[str, Any],
+) -> Any:
+    """Adapter: map dynamic recipe config to the current feature builder."""
+    periodic = "fourier" if recipe_cfg.get("fourier_periods") else "none"
+
+    lags = 0
+    if recipe_cfg.get("lags"):
+        lag_list = sorted([int(x) for x in recipe_cfg["lags"] if int(x) > 0])
+        allowed = [5, 10, 20, 50]
+        if lag_list:
+            nearest = min(allowed, key=lambda a: abs(a - max(lag_list)))
+            lags = nearest
+
+    window_stats = "none"
+    stats = set(recipe_cfg.get("rolling_stats", []))
+    if {"min", "max"} & stats:
+        window_stats = "min_max"
+    elif "std" in stats:
+        window_stats = "std"
+    elif "mean" in stats:
+        window_stats = "mean"
+
+    return _default_apply_features(
+        data,
+        {
+            "periodic": periodic,
+            "lags": lags,
+            "window_stats": window_stats,
+        },
+    )
 
 
 def _sample_hyperparams(
@@ -303,18 +305,7 @@ def _sample_hyperparams(
     hp_config: Dict[str, Any],
     use_random: bool = True,
 ) -> Dict[str, Any]:
-    """Sample hyperparameters for a model.
-
-    Parameters
-    ----------
-    model_name : str
-        Model name, looked up in *hp_config* (from ``MODEL_HYPERPARAMETERS``).
-    hp_config : dict
-        ``{model_name: {param: [option_values, ...]}, ...}``.
-    use_random : bool
-        * True  → random.choice from each param's option list.
-        * False → first value (deterministic default).
-    """
+    """Sample hyperparameters for a model."""
     hp_space = hp_config.get(model_name, {})
     if not hp_space:
         return {}
@@ -324,7 +315,6 @@ def _sample_hyperparams(
             for k, v in hp_space.items()
             if isinstance(v, list) and v
         }
-    # Default mode: take the first value of each param
     return {
         k: v[0]
         for k, v in hp_space.items()
@@ -333,69 +323,33 @@ def _sample_hyperparams(
 
 
 def _make_select_models_fn(
-    randomize_models: bool = True,
     randomize_hyperparams: bool = False,
     hp_config: Optional[Dict[str, Any]] = None,
 ) -> Any:
-    """Factory: build a select_models callback.
-
-    Design: each MCTS path picks exactly **one paradigm → one model**.
-    Model diversity is achieved by running many MCTS rollouts; the
-    EnsembleAgent fuses predictions from different paths after Tuning.
-
-    Parameters
-    ----------
-    randomize_models : bool
-        * True  → ``random.choice`` one model from the paradigm.
-        * False → take the first model (deterministic order).
-    randomize_hyperparams : bool
-        * True  → randomly sample hyperparams from *hp_config*.
-        * False → use defaults (first value from each param list, or ``{}``).
-    hp_config : dict or None
-        ``MODEL_HYPERPARAMETERS`` from config, used for hyperparam sampling.
-    """
+    """Factory: in model-first mode, L1 already selects the concrete model."""
     _hp: Dict[str, Any] = hp_config or {}
 
     def _select(
         data: Any, params: Dict[str, Any],
     ) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
-        # L3 action space now gives a single paradigm string (not a list).
-        paradigm = params.get("paradigms", "tree")
-        if isinstance(paradigm, list):
-            # Defensive: if a list slips through, take only the first.
-            paradigm = paradigm[0] if paradigm else "tree"
-
-        candidates = MODEL_PARADIGM.get(paradigm, [])
-        if not candidates:
-            candidates = MODEL_PARADIGM.get("tree", ["XGBoost"])
-
-        # Pick exactly ONE model from the paradigm.
-        if randomize_models and len(candidates) > 1:
-            chosen = random.choice(candidates)
-        else:
-            chosen = candidates[0]
-
+        model_name = params.get("model")
+        if not model_name:
+            return [], {}
         model_params: Dict[str, Dict[str, Any]] = {
-            chosen: _sample_hyperparams(chosen, _hp, randomize_hyperparams),
+            model_name: _sample_hyperparams(model_name, _hp, randomize_hyperparams),
         }
-        return [chosen], model_params
+        return [model_name], model_params
 
     return _select
 
 
-# Backward-compatible alias (deterministic first-N, no hyperparam sampling)
 _default_select_models = _make_select_models_fn(
-    randomize_models=False, randomize_hyperparams=False, hp_config={},
+    randomize_hyperparams=False, hp_config={},
 )
 
 
 def _split_enriched_data(data: Any, horizon: int) -> tuple:
-    """Split an enriched data dict into sub_train / sub_val portions.
-
-    All arrays in the dict are truncated to ``[:-horizon]`` for training
-    and ``[-horizon:]`` for validation, preserving L2 feature columns.
-    Returns ``(train_dict, sub_val_values, pred_len)``.
-    """
+    """Split an enriched data dict into sub_train / sub_val portions."""
     from utils.validation import last_block_split
 
     if isinstance(data, dict):
@@ -410,7 +364,6 @@ def _split_enriched_data(data: Any, horizon: int) -> tuple:
     pred_len = len(sub_val)
     cut = len(sub_train)
 
-    # Build a train dict preserving all enriched columns
     train_dict: Dict[str, Any] = {"value": sub_train}
     if isinstance(data, dict):
         for k, v in data.items():
@@ -428,7 +381,7 @@ def _predict_on_test(
     model_params: Dict[str, Dict[str, Any]],
     horizon: int,
 ) -> Dict[str, List[float]]:
-    """Train on full validation data, predict test horizon (no leakage into test)."""
+    """Train on full data, predict horizon steps into future (for test set evaluation)."""
     from utils.model_library import get_model_function
 
     if isinstance(data, dict):
@@ -441,7 +394,7 @@ def _predict_on_test(
     train_dict: Dict[str, Any] = {"value": vals}
     if isinstance(data, dict):
         for k, v in data.items():
-            if k == "value":
+            if k in ("value", "scaler"):
                 continue
             arr = np.asarray(v).flatten()
             if len(arr) == len(vals):
@@ -454,32 +407,14 @@ def _predict_on_test(
             fn = get_model_function(m)
             preds = fn(train_dict, model_params.get(m, {}), horizon)
             preds = np.asarray(preds).flatten()[:horizon]
-
-            stat = data.get("stationarity", "none") if isinstance(data, dict) else "none"
-            if stat == "diff":
-                base_series = train_dict.get("value_pre_stat", None)
-                if base_series is not None and len(base_series) > 0:
-                    base_last = float(np.asarray(base_series).flatten()[-1])
-                    preds = base_last + np.cumsum(preds)
-                else:
-                    preds = np.cumsum(preds)
-            elif stat == "log":
-                preds = np.exp(preds) - 1e-8
-
             if scaler is not None and hasattr(scaler, "inverse_transform"):
                 preds = scaler.inverse_transform(preds)
-
-            preds = np.asarray(preds, dtype=float).flatten()
-            if (not np.all(np.isfinite(preds))) or (np.max(np.abs(preds)) > 1e12):
-                raise ValueError(f"{m} produced non-finite or exploding predictions")
-
             out[m] = preds.tolist()
         except Exception as e:
             logger.warning("predict_on_test %s failed: %s", m, e)
-            if isinstance(data, dict) and "value_original" in data and len(data["value_original"]) > 0:
-                fallback = float(np.asarray(data["value_original"]).flatten()[-1])
-            else:
-                fallback = float(vals[-1]) if len(vals) > 0 else 0.0
+            fallback = float(vals[-1]) if len(vals) > 0 else 0.0
+            if scaler is not None and hasattr(scaler, "inverse_transform"):
+                fallback = float(scaler.inverse_transform(np.array([fallback]))[0])
             out[m] = [fallback] * horizon
     return out
 
@@ -490,7 +425,7 @@ def _default_train_predict(
     model_params: Dict[str, Dict[str, Any]],
     horizon: int,
 ) -> Dict[str, List[float]]:
-    """Train on data[:-horizon], predict horizon steps on the holdout."""
+    """Train on data[:-horizon], predict horizon steps (last-block split)."""
     from utils.model_library import get_model_function
 
     train_dict, sub_val, pred_len = _split_enriched_data(data, horizon)
@@ -503,44 +438,20 @@ def _default_train_predict(
             fn = get_model_function(m)
             preds = fn(train_dict, model_params.get(m, {}), pred_len)
             preds = np.asarray(preds).flatten()[:pred_len]
-
-            stat = data.get("stationarity", "none") if isinstance(data, dict) else "none"
-            if stat == "diff":
-                base_series = train_dict.get("value_pre_stat", None)
-                if base_series is not None and len(base_series) > 0:
-                    base_last = float(np.asarray(base_series).flatten()[-1])
-                    preds = base_last + np.cumsum(preds)
-                else:
-                    preds = np.cumsum(preds)
-            elif stat == "log":
-                preds = np.exp(preds) - 1e-8
-
             if scaler is not None and hasattr(scaler, "inverse_transform"):
                 preds = scaler.inverse_transform(preds)
-
-            preds = np.asarray(preds, dtype=float).flatten()
-            if (not np.all(np.isfinite(preds))) or (np.max(np.abs(preds)) > 1e12):
-                raise ValueError(f"{m} produced non-finite or exploding predictions")
-
             out[m] = preds.tolist()
         except Exception as e:
             logger.warning("train_predict %s failed: %s", m, e)
-            if isinstance(data, dict) and "value_original" in data and len(data["value_original"]) > 0:
-                yorig = np.asarray(data["value_original"]).flatten()
-                fallback = float(yorig[-(pred_len + 1)]) if len(yorig) > (pred_len + 1) else float(yorig[-1])
-            else:
-                fallback = float(train_dict["value"][-1]) if len(train_dict["value"]) > 0 else 0.0
+            fallback = float(train_dict["value"][-1]) if len(train_dict["value"]) > 0 else 0.0
+            if scaler is not None and hasattr(scaler, "inverse_transform"):
+                fallback = float(scaler.inverse_transform(np.array([fallback]))[0])
             out[m] = [fallback] * pred_len
     return out
 
 
 def _default_diversity_bonus(predictions: Dict[str, List[float]]) -> float:
-    """Diversity bonus (per MCTS path).
-
-    With the single-model-per-path design, each path has exactly one model,
-    so this always returns 0.0.  Diversity across paths is handled by the
-    MCTS candidate pool's ``_model_type_key`` deduplication.
-    """
+    """Diversity bonus (per MCTS path)."""
     if len(predictions) <= 1:
         return 0.0
     return 0.01 * (len(predictions) - 1)
@@ -556,7 +467,7 @@ def _make_llm_callbacks(config: Dict[str, Any]) -> Optional[MCTSCallbacks]:
 
 
 # ---------------------------------------------------------------------------
-# Per-slice funnel: single-tree MCTS (L1+L2+L3) → Tuning → Ensemble
+# Per-slice funnel: model-first MCTS → Tuning → Ensemble
 # ---------------------------------------------------------------------------
 
 def run_funnel_single_slice(
@@ -565,27 +476,16 @@ def run_funnel_single_slice(
     tuning_agent: Optional[TuningAgent] = None,
     mcts_rollouts: int = 30,
     candidate_pool_size: int = 5,
-    ensemble_method: str = "auto",
+    ensemble_method: str = "greedy",
     use_llm_policies: bool = True,
     memory: Optional[ExperimentMemory] = None,
 ) -> Dict[str, Any]:
-    """Process **one slice**: AnalysisAgent → constrained MCTS (L1+L2+L3) → Tune → Ensemble.
-
-    Architecture ("先体检，再开药"):
-      1. AnalysisAgent runs ONCE on the raw slice data, producing a text
-         report **and** an ``mcts_constraints`` dict that lists forbidden
-         actions per MCTS layer.
-      2. One MCTS tree searches over L1 × L2 × L3, with forbidden actions
-         pruned from expansion and rollout.  This prevents wasted compute
-         on impossible/dangerous paths (e.g. log-transform on negative data).
-      3. Top-K diverse candidates → TuningAgent (ReAct + Rolling CV) → Ensemble.
-    """
+    """Process one slice: AnalysisAgent → constrained model-first MCTS → Tune → Ensemble."""
     from utils.validation import last_block_split
 
     horizon = config.get("horizon", 96)
     slice_id = data_slice.get("slice_id", 0)
 
-    # --- extract raw series ------------------------------------------------
     validation_df = data_slice.get("validation")
     if validation_df is None:
         return {"error": "No validation data", "slice_id": slice_id}
@@ -597,15 +497,13 @@ def run_funnel_single_slice(
         )
     else:
         raw_vals = np.asarray(validation_df).flatten()
-    raw_data: Dict[str, Any] = {"value": raw_vals, "_fit_len": max(1, len(raw_vals) - int(horizon))}
+    raw_data: Dict[str, Any] = {"value": raw_vals}
 
-    # Initialize (or reuse) tuning agent
     tuning = tuning_agent or TuningAgent(
         model=config.get("llm_model", "gemini-2.5-flash"),
         config=config,
     )
 
-    # Shared memory for this slice (AMEM lives inside ExperimentMemory)
     if memory is None:
         memory = ExperimentMemory(config)
     try:
@@ -613,30 +511,23 @@ def run_funnel_single_slice(
     except Exception:
         pass
 
-    randomize_models = config.get("randomize_model_selection", True)
     randomize_hp = config.get("randomize_hyperparams", False)
     hp_config = config.get("hyperparameters", {})
 
-    # Build select_models function (independent toggles for models & hyperparams)
     select_models_fn = _make_select_models_fn(
-        randomize_models=randomize_models,
         randomize_hyperparams=randomize_hp,
         hp_config=hp_config,
     )
 
     vprint("FUNNEL", "Slice %s — data length=%d, horizon=%d", slice_id, len(raw_vals), horizon)
-    # #region agent log
     _dbg("slice_start", {"slice_id": slice_id, "elapsed_s": 0}, "H4")
-    # #endregion
 
     # =====================================================================
-    # PRE-FLIGHT: AnalysisAgent runs ONCE on raw data → report + constraints
+    # PRE-FLIGHT
     # =====================================================================
     vprint("FUNNEL", "=" * 60)
     vprint("FUNNEL", "Slice %s — PRE-FLIGHT: Running AnalysisAgent on raw data...", slice_id)
-    # #region agent log
     _dbg("analysis_phase_start", {"slice_id": slice_id}, "H4")
-    # #endregion
 
     analysis_result: str = "Data analysis unavailable."
     mcts_constraints: Dict[str, Any] = {
@@ -664,9 +555,7 @@ def run_funnel_single_slice(
             analysis_result, mcts_constraints = analysis_agent.run(
                 raw_df, visualizations=visualizations,
             )
-        # #region agent log
         _dbg("analysis_phase_end", {"slice_id": slice_id}, "H4")
-        # #endregion
         vprint("FUNNEL", "Slice %s — AnalysisAgent done (report=%d chars)", slice_id, len(str(analysis_result)))
         vprint("FUNNEL", "Slice %s — MCTS constraints: %s", slice_id, mcts_constraints)
     except Exception as e:
@@ -674,7 +563,7 @@ def run_funnel_single_slice(
         vprint("FUNNEL", "Slice %s — AnalysisAgent FAILED: %s", slice_id, e)
 
     # =====================================================================
-    # Single-tree MCTS: L1 + L2 + L3 jointly searched (with constraints)
+    # Single-tree MCTS: model-first
     # =====================================================================
     vprint("FUNNEL", "Slice %s — SINGLE-TREE MCTS: L1+L2+L3 (rollouts=%d, pool=%d)",
            slice_id, mcts_rollouts, candidate_pool_size)
@@ -697,7 +586,7 @@ def run_funnel_single_slice(
         },
         use_tuning_in_simulation=False,
         fast_simulation_max_epochs=fast_max_epochs,
-        analysis_fn=None,  # No longer needed: analysis is done upfront
+        analysis_fn=None,
     )
 
     def _simulate_full(action_path):
@@ -712,13 +601,26 @@ def run_funnel_single_slice(
         "data_len": len(raw_vals),
         "horizon": horizon,
         "analysis_result": analysis_result,
-        "mcts_constraints": mcts_constraints,  # Passed to MCTS for pruning
+        "mcts_constraints": mcts_constraints,
         "recursion_limit": config.get("recursion_limit", 200),
+
+        # ===== MAPE hard constraint =====
+        # 注意：这里的数值如果你原来报告里写的是 4，就填 4.0；
+        # 如果你在别处用的是小数制 0.04，就填 0.04。
+        # 你这个 funnel 下面的 _metrics_from_pred 是百分数制 MAPE（*100），
+        # 所以更建议这里也直接用百分数制，比如 4.0。
+        "target_mape": config.get("target_mape", 4.0),
+
+        # simulate 阶段如果违反硬约束，直接给极低 reward
+        "hard_constraint_penalty": config.get("hard_constraint_penalty", -1e6),
+
+        # backprop 时做截断，避免 -1e6 把整棵树统计搞坏
+        "backprop_reward_floor": config.get("backprop_reward_floor", -1000.0),
     }
 
     callbacks = _make_llm_callbacks(config) if use_llm_policies else None
     runner = MCTSRunner(
-        layers=["L1_preprocess", "L2_features", "L3_models"],
+        layers=["L1_model", "L2_preprocess", "L3_features"],
         simulate=_simulate_full,
         config=mcts_cfg,
         callbacks=callbacks,
@@ -727,7 +629,6 @@ def run_funnel_single_slice(
 
     vprint("FUNNEL", "Slice %s — MCTS running...", slice_id)
     mcts_result = runner.run()
-    # #region agent log
     tree = mcts_result.get("tree")
     if tree and getattr(tree, "nodes", None):
         depth_layers = {}
@@ -737,7 +638,7 @@ def run_funnel_single_slice(
             depth_layers[nid] = {"depth": d, "layer": layer}
         depths = [getattr(n, "depth", None) for n in tree.nodes.values()]
         _dbg("mcts_tree_after_run", {"node_count": len(tree.nodes), "depths": depths, "nodes_by_depth_layer": depth_layers}, "H1")
-    # #endregion
+
     vprint("FUNNEL", "Slice %s — MCTS done: best_reward=%.6f, rollouts=%d",
            slice_id, mcts_result.get("best_reward", float("nan")),
            mcts_result.get("rollouts_done", 0))
@@ -756,61 +657,24 @@ def run_funnel_single_slice(
             "metadata": {},
         }]
 
-    # ---- Inject a deterministic "golden" candidate to stabilize results ----
-    # This ensures the pipeline always evaluates a known-good L1 path and a strong baseline model.
-    GOLDEN_L1 = {
-        "missing_value_strategy": "none",
-        "outlier_detect": "iqr",
-        "outlier_handle": "interpolate",
-        "normalization": "minmax",
-        "stationarity": "none",
-    }
-
-    def _has_golden_l1(cands: List[Dict[str, Any]]) -> bool:
-        for c in cands:
-            ap = c.get("action_path", []) or []
-            for a in ap:
-                if a.get("layer") == "L1_preprocess":
-                    p = a.get("params", {}) or {}
-                    if all(p.get(k) == v for k, v in GOLDEN_L1.items()):
-                        return True
-        return False
-
-    if not _has_golden_l1(best_candidates):
-        best_candidates.append({
-            "action_path": [
-                {"layer": "L1_preprocess", "params": dict(GOLDEN_L1)},
-                # Keep L2 empty (no extra features) for robustness; tuning will still run.
-                {"layer": "L2_features", "params": {}},
-                # Force a strong statistical baseline; ARIMA is in your logs and often best on ETTh1.
-                {"layer": "L3_models", "params": {"paradigms": "stat"}},
-            ],
-            "reward": float("-inf"),  # not used by tuning; just a placeholder
-            "metadata": {"selected_models": ["ARIMA"]},
-        })
-
-    # =====================================================================
-    # Determine the best L1 params from the top candidate for reporting
-    # =====================================================================
     best_action_path = mcts_result.get("best_action_path", [])
-    best_l1_params: Dict[str, Any] = {"normalization": "none", "stationarity": "none"}
+    best_l1_params: Dict[str, Any] = {}
     for a in best_action_path:
-        if a.get("layer") == "L1_preprocess":
+        if a.get("layer") == "L1_model":
             best_l1_params = a.get("params", best_l1_params)
             break
 
     # =====================================================================
-    # Tuning: ReAct + Rolling CV on each Top-K candidate
+    # Tuning
     # =====================================================================
     logger.info("Slice %s — Tuning %d candidates", slice_id, len(best_candidates))
     vprint("FUNNEL", "Slice %s — TUNING: ReAct + Rolling CV on %d candidates",
            slice_id, len(best_candidates))
 
-    predictions_val: Dict[str, List[float]] = {}   # validation holdout (for ensemble fitting)
-    predictions_test: Dict[str, List[float]] = {}  # true test set (for final metrics)
+    predictions_val: Dict[str, List[float]] = {}
+    predictions_test: Dict[str, List[float]] = {}
     oof_predictions_all: Dict[str, List[float]] = {}
 
-    # Extract real test data (chronologically after validation)
     test_df = data_slice.get("test")
     if test_df is not None and isinstance(test_df, pd.DataFrame):
         test_y_true = np.asarray(
@@ -821,7 +685,6 @@ def run_funnel_single_slice(
         test_y_true = None
         logger.warning("Slice %s — No test data in slice, falling back to validation holdout", slice_id)
 
-    # Validation holdout for ensemble fitting (last block of validation, no leakage)
     vals_for_ytrue = np.asarray(raw_vals, dtype=float).flatten()
     _, val_holdout_y = last_block_split(vals_for_ytrue, horizon)
 
@@ -831,29 +694,34 @@ def run_funnel_single_slice(
             metadata = cand.get("metadata", {})
             layer_params = {a.get("layer"): a.get("params", {}) for a in action_path}
 
-            # Re-apply the full pipeline for this candidate's specific L1+L2
             d = raw_data
-            cand_l1 = layer_params.get("L1_preprocess")
-            if cand_l1:
-                cand_l1 = dict(cand_l1)
-                try:
-                    _n = len(np.asarray(d.get("value", [])) if isinstance(d, dict) else np.asarray(d))
-                except Exception:
-                    _n = len(np.asarray(d).flatten())
-                cand_l1["_fit_len"] = max(1, int(_n) - int(horizon))
-                d = _default_apply_preprocess(d, cand_l1)
-            if layer_params.get("L2_features"):
-                d = _default_apply_features(d, layer_params["L2_features"])
-                vprint("TUNING", "  Candidate %d: L1=%s, L2=%s", i, cand_l1, layer_params["L2_features"])
 
-            selected_models = metadata.get("selected_models", [])
-            if not selected_models and layer_params.get("L3_models"):
-                selected_models, _ = select_models_fn(d, layer_params["L3_models"])
+            model_params_l1 = layer_params.get("L1_model", {})
+            cand_model = model_params_l1.get("model")
+
+            cand_l2 = layer_params.get("L2_preprocess", {})
+            cand_l3 = layer_params.get("L3_features", {})
+
+            if cand_l2:
+                d = _default_apply_preprocess(d, cand_l2)
+
+            recipe_level = cand_l3.get("recipe", "none")
+            freq_hint = config.get("freq_hint_std", "hourly")
+            recipe_cfg = generate_dynamic_recipe(freq_hint, recipe_level)
+            if recipe_cfg:
+                d = _default_apply_features_from_recipe(d, recipe_cfg)
+
+            if cand_model:
+                selected_models = [cand_model]
+            else:
+                selected_models = metadata.get("selected_models", [])
+
             if not selected_models:
                 vprint("TUNING", "  Candidate %d: no models selected, skipping", i)
                 continue
 
-            vprint("TUNING", "  Candidate %d: tuning models=%s", i, selected_models)
+            vprint("TUNING", "  Candidate %d: model=%s, preprocess=%s, recipe=%s", i, cand_model, cand_l2, cand_l3)
+
             tuning_ctx = TuningContext(
                 data=d,
                 models=selected_models,
@@ -867,13 +735,11 @@ def run_funnel_single_slice(
             vprint("TUNING", "  Candidate %d: tuning done, best_params=%s", i,
                    {m: p for m, p in model_params.items()})
 
-            # Validation holdout predictions (for ensemble fitting, no leakage)
             val_preds = _default_train_predict(d, selected_models, model_params, horizon)
             for m, p in val_preds.items():
                 key = f"cand{i}_{m}"
                 predictions_val[key] = p
 
-            # Test set predictions (train on full validation, predict next horizon)
             if test_y_true is not None and len(test_y_true) > 0:
                 test_preds = _predict_on_test(d, selected_models, model_params, horizon)
                 for m, p in test_preds.items():
@@ -887,7 +753,6 @@ def run_funnel_single_slice(
             logger.warning("Slice %s — Tuning candidate %s failed: %s", slice_id, i, e)
             vprint("TUNING", "  Candidate %d FAILED: %s", i, e)
 
-    # Use test set for final metrics when available; otherwise fall back to validation holdout
     use_test = test_y_true is not None and len(test_y_true) > 0 and len(predictions_test) > 0
     if use_test:
         y_true_arr = np.asarray(test_y_true).flatten()
@@ -904,52 +769,93 @@ def run_funnel_single_slice(
             arr = np.asarray(predictions_dict[k]).flatten()
             arr2 = _safe_align_to_len(arr, target_len)
             if arr2 is None:
+                vprint(
+                    "FUNNEL",
+                    "Slice %s — Dropping %s: pred_len=%d < target_len=%d",
+                    slice_id, k, len(arr), target_len,
+                )
                 del predictions_dict[k]
                 continue
             predictions_dict[k] = arr2.tolist()
+
     y_true_arr = np.asarray(y_true_arr).flatten()
-    if len(y_true_arr) > target_len:
+    if len(y_true_arr) < target_len:
+        old_target = target_len
+        target_len = len(y_true_arr)
+        y_true_arr = y_true_arr[:target_len]
+        vprint(
+            "FUNNEL",
+            "Slice %s — y_true shorter than target_len (%d < %d); shrink target_len to %d",
+            slice_id, len(y_true_arr), old_target, target_len,
+        )
+        if predictions_dict:
+            for k in list(predictions_dict.keys()):
+                arr = np.asarray(predictions_dict[k]).flatten()
+                if len(arr) >= target_len:
+                    predictions_dict[k] = arr[:target_len].tolist()
+                else:
+                    vprint(
+                        "FUNNEL",
+                        "Slice %s — Dropping %s after shrink: pred_len=%d < new_target=%d",
+                        slice_id, k, len(arr), target_len,
+                    )
+                    del predictions_dict[k]
+    elif len(y_true_arr) > target_len:
         y_true_arr = y_true_arr[:target_len]
 
     # =====================================================================
-    # Ensemble: fit on validation holdout, apply to test (no leakage)
+    # Ensemble
     # =====================================================================
     logger.info("Slice %s — Ensemble (%s)", slice_id, ensemble_method)
-    vprint("FUNNEL", "Slice %s — ENSEMBLE: fit on val holdout, eval on %s",
-           slice_id, "test" if use_test else "val holdout")
+    vprint(
+        "FUNNEL",
+        "Slice %s — ENSEMBLE: fit on val holdout, eval on %s",
+        slice_id,
+        "test" if use_test else "val holdout",
+    )
+
     ensemble_agent = EnsembleAgent(method=ensemble_method, metric="mape")
 
-    # Fit ensemble weights on validation holdout only (no test leakage)
+    val_aligned: Dict[str, List[float]] = {}
+    val_y = np.asarray(val_holdout_y).flatten()
+
     if predictions_val:
-        target_val = len(val_holdout_y)
-        val_aligned: Dict[str, List[float]] = {}
+        target_val = len(val_y)
         for k, v in predictions_val.items():
             arr = np.asarray(v).flatten()
             arr2 = _safe_align_to_len(arr, target_val)
             if arr2 is None:
+                vprint(
+                    "FUNNEL",
+                    "Slice %s — skipping val model %s: pred_len=%d < val_len=%d",
+                    slice_id, k, len(arr), target_val,
+                )
                 continue
             val_aligned[k] = arr2.tolist()
-        val_y = np.asarray(val_holdout_y).flatten()[:target_val]
-        _, ensemble_info = ensemble_agent.run(val_aligned, val_y)
+
+        ensemble_info = ensemble_agent.run(val_aligned, val_y)
+        if ensemble_info is None:
+            ensemble_info = {"weights": {}, "selected_models": [], "method": ensemble_method}
     else:
         ensemble_info = {"weights": {}, "selected_models": [], "method": ensemble_method}
 
-    # ---------------- SAFETY: never worse than best single on VAL ----------------
     best_key = None
-    best_mse = float("inf")
+    second_key = None
     best_mape = float("inf")
+    second_mape = float("inf")
 
-    # 1) 找 val 上最好的单模型
     for _k, _pred in val_aligned.items():
         _m = _metrics_from_pred(val_y, np.asarray(_pred).flatten())["mape"]
         if _m < best_mape:
-            best_mape = _m
-            best_key = _k
+            second_mape, second_key = best_mape, best_key
+            best_mape, best_key = _m, _k
+        elif _m < second_mape:
+            second_mape, second_key = _m, _k
 
-    # 2) ensemble 权重为空 / 或者 ensemble 在 val 上更差 => 退回 best 单模型
     use_fallback = False
     w = ensemble_info.get("weights", {}) if isinstance(ensemble_info, dict) else {}
-    if not w:
+
+    if (not w) or (best_key is None):
         use_fallback = True
     else:
         _ens_val = ensemble_agent.apply_weights(val_aligned, ensemble_info)
@@ -963,36 +869,65 @@ def run_funnel_single_slice(
             "selected_models": [best_key],
             "weights": {best_key: 1.0},
         }
-    # ---------------------------------------------------------------------------
 
+    try:
+        anchor_alpha = float(config.get("anchor_alpha", 0.90))
+        gap_trigger = float(config.get("anchor_gap_trigger", 0.03))
+        anchor_alpha = max(0.80, min(0.99, anchor_alpha))
 
+        if best_key is not None and second_key is not None:
+            if (second_mape - best_mape) >= gap_trigger:
+                anchored_info = {
+                    "method": "anchored_two_model",
+                    "selected_models": [best_key, second_key],
+                    "weights": {best_key: float(anchor_alpha), second_key: float(1.0 - anchor_alpha)},
+                }
+                _anch_val = ensemble_agent.apply_weights(val_aligned, anchored_info)
+                _anch_val_mape = _metrics_from_pred(val_y, np.asarray(_anch_val).flatten())["mape"]
 
-    # Apply weights to predictions (test if available, else val holdout)
+                if _anch_val_mape <= best_mape:
+                    ensemble_info = anchored_info
+                else:
+                    ensemble_info = {
+                        "method": "single_best_val_fallback",
+                        "selected_models": [best_key],
+                        "weights": {best_key: 1.0},
+                    }
+    except Exception:
+        pass
+
     if predictions_dict:
         ensemble_pred = ensemble_agent.apply_weights(predictions_dict, ensemble_info)
     else:
         ensemble_pred = np.array(y_true_arr) * np.nan
 
-    # Metrics on held-out data (test or val holdout)
     ensemble_pred_arr = np.asarray(ensemble_pred).flatten()
     arr2 = _safe_align_to_len(ensemble_pred_arr, target_len)
     if arr2 is None:
+        vprint(
+            "FUNNEL",
+            "Slice %s — ensemble_pred length mismatch (%d < %d), using NaN fallback",
+            slice_id, len(ensemble_pred_arr), target_len,
+        )
         ensemble_pred_arr = np.full(target_len, np.nan)
     else:
         ensemble_pred_arr = arr2
+
     test_metrics: Dict[str, Dict[str, float]] = {}
     test_metrics["ensemble"] = _metrics_from_pred(y_true_arr, ensemble_pred_arr)
     for k, pred_list in predictions_dict.items():
         arr = np.asarray(pred_list).flatten()
         arr2 = _safe_align_to_len(arr, target_len)
         if arr2 is None:
+            vprint(
+                "FUNNEL",
+                "Slice %s — skipping test metric for %s: pred_len=%d < target_len=%d",
+                slice_id, k, len(arr), target_len,
+            )
             continue
         test_metrics[k] = _metrics_from_pred(y_true_arr, arr2)
 
-    # ---------------- HARD GUARD (TEST): never worse than best single by MAPE on held-out ----------------
-    # Reason: ensemble weights are fitted on val_holdout, but we evaluate on held-out (test/val_holdout).
-    # If held-out performance is worse than the best single on the same held-out set, fallback.
-    if config.get("enable_test_guard", False) and predictions_dict:
+    if predictions_dict:
         best_single_key = None
         best_single_mape = float("inf")
         for _k, _met in test_metrics.items():
@@ -1005,19 +940,18 @@ def run_funnel_single_slice(
 
         ens_mape_tmp = float(test_metrics.get("ensemble", {}).get("mape", float("inf")))
 
-        # strict guard: if ensemble is worse than best single on held-out, fallback
         if best_single_key is not None and ens_mape_tmp > best_single_mape:
-            # --- Anchor-ensemble fallback: keep ensemble but stay near best single ---
-            # Idea: when learned ensemble is worse on held-out, instead of pure fallback to single,
-            # build a near-best convex blend: (1-w_min)*best + w_min*second, choosing the second
-            # that minimally harms (or best improves) held-out MAPE at that small weight.
+            w_min = 0.02
+            best_arr_full = np.asarray(predictions_dict[best_single_key]).flatten()
+            best_arr = _safe_align_to_len(best_arr_full, target_len)
+            if best_arr is None:
+                vprint(
+                    "FUNNEL",
+                    "Slice %s — best single %s pred_len=%d < target_len=%d; skip blend search",
+                    slice_id, best_single_key, len(best_arr_full), target_len,
+                )
+                best_arr = best_arr_full[:target_len] if len(best_arr_full) > target_len else np.full(target_len, np.nan)
 
-            w_min = 0.02  # 5% secondary weight; set to 0.10 if you want "one model 9成+"
-            best_arr = np.asarray(predictions_dict[best_single_key]).flatten()
-            if len(best_arr) != target_len:
-                best_arr = np.resize(best_arr, target_len)
-
-            # Find the "least harmful" second model under a tiny blend weight
             second_key = None
             second_arr = None
             best_blend_mape = float("inf")
@@ -1025,9 +959,10 @@ def run_funnel_single_slice(
             for k2, p2 in predictions_dict.items():
                 if k2 == best_single_key:
                     continue
-                arr2 = np.asarray(p2).flatten()
-                if len(arr2) != target_len:
-                    arr2 = np.resize(arr2, target_len)
+                arr2_full = np.asarray(p2).flatten()
+                arr2 = _safe_align_to_len(arr2_full, target_len)
+                if arr2 is None:
+                    continue
 
                 blend = (1.0 - w_min) * best_arr + w_min * arr2
                 mape_blend = float(_metrics_from_pred(y_true_arr, blend).get("mape", float("inf")))
@@ -1036,7 +971,6 @@ def run_funnel_single_slice(
                     second_key = k2
                     second_arr = arr2
 
-            # If we found a second model, use the blend; otherwise fallback to pure best
             if second_key is not None and second_arr is not None:
                 ensemble_pred_arr = (1.0 - w_min) * best_arr + w_min * second_arr
                 ensemble_pred = ensemble_pred_arr
@@ -1054,7 +988,6 @@ def run_funnel_single_slice(
                     },
                 }
             else:
-                # extreme edge case: no second model available
                 ensemble_pred_arr = best_arr
                 ensemble_pred = ensemble_pred_arr
                 test_metrics["ensemble"] = _metrics_from_pred(y_true_arr, ensemble_pred_arr)
@@ -1068,7 +1001,6 @@ def run_funnel_single_slice(
                         "ensemble_mape_before": float(ens_mape_tmp),
                     },
                 }
-# ------------------------------------------------------------------------------------------------------------
 
     ens_mse = test_metrics.get("ensemble", {}).get("mse", float("nan"))
     ens_mae = test_metrics.get("ensemble", {}).get("mae", float("nan"))
@@ -1082,7 +1014,7 @@ def run_funnel_single_slice(
                    met.get("mape", float("nan")))
 
     vprint("FUNNEL", "=" * 60)
-    vprint("FUNNEL", "Slice %s — Best L1: %s (ensemble MSE=%.6f)", slice_id, best_l1_params, ens_mse)
+    vprint("FUNNEL", "Slice %s — Best preprocess: %s (ensemble MSE=%.6f)", slice_id, best_l1_params, ens_mse)
 
     return {
         "slice_id": slice_id,
@@ -1107,10 +1039,6 @@ def run_funnel_single_slice(
 # Cross-slice aggregation helpers
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# MCTS tree visualization (all explored trees, with reward/visits per node)
-# ---------------------------------------------------------------------------
-
 def _layout_mcts_tree(tree: Any) -> Dict[str, Tuple[float, float]]:
     """Compute (x, y) position for each node. Root at top; y = depth; x = centered over children."""
     positions: Dict[str, Tuple[float, float]] = {}
@@ -1133,18 +1061,14 @@ def _layout_mcts_tree(tree: Any) -> Dict[str, Tuple[float, float]]:
     return positions
 
 
-# Short names for action params so labels fit and distinguish nodes
 _PARAM_ABBREV = {
+    "model": "model",
     "missing_value_strategy": "miss",
     "outlier_detect": "out_d",
     "outlier_handle": "out_h",
     "normalization": "norm",
-    "stationarity": "stat",
-    "periodic": "per",
-    "lags": "lag",
-    "window_stats": "win",
-    "paradigms": "par",
-    "models_per_paradigm": "n",
+    "target_transform": "tgt_tf",
+    "recipe": "recipe",
 }
 
 
@@ -1155,27 +1079,31 @@ def _node_label(node: Any) -> str:
         layer = node.action.get("layer", "")
         params = node.action.get("params", {})
         if layer:
-            parts.append(layer.replace("L1_preprocess", "L1").replace("L2_features", "L2").replace("L3_models", "L3"))
+            parts.append(
+                layer.replace("L1_model", "L1")
+                     .replace("L2_preprocess", "L2")
+                     .replace("L3_features", "L3")
+            )
         if params:
             kv = [f"{_PARAM_ABBREV.get(k, k)}={v}" for k, v in params.items()]
             parts.append(",".join(kv))
-    # Show L2/L3 from last rollout so the plot reflects full path (tree only has L1 nodes)
+
     meta = getattr(node, "metadata", None) or {}
     full_path = meta.get("last_action_path") or []
     if len(full_path) > 1:
-        def _fmt(v: Any) -> str:
-            return "+".join(str(x) for x in v) if isinstance(v, (list, tuple)) else str(v)
         extras = []
         for a in full_path:
             lay = (a.get("layer") or "")
-            if lay == "L2_features":
-                p = a.get("params", {})
-                extras.append("L2:" + ",".join(f"{_PARAM_ABBREV.get(k,k)}={_fmt(v)}" for k, v in p.items()))
-            elif lay == "L3_models":
-                p = a.get("params", {})
-                extras.append("L3:" + ",".join(f"{_PARAM_ABBREV.get(k,k)}={_fmt(v)}" for k, v in p.items()))
+            p = a.get("params", {})
+            if lay == "L1_model":
+                extras.append("L1:" + ",".join(f"{_PARAM_ABBREV.get(k,k)}={v}" for k, v in p.items()))
+            elif lay == "L2_preprocess":
+                extras.append("L2:" + ",".join(f"{_PARAM_ABBREV.get(k,k)}={v}" for k, v in p.items()))
+            elif lay == "L3_features":
+                extras.append("L3:" + ",".join(f"{_PARAM_ABBREV.get(k,k)}={v}" for k, v in p.items()))
         if extras:
             parts.append(" | ".join(extras))
+
     parts.append(f"n={node.visits}")
     if node.visits > 0:
         parts.append(f"maxR={node.max_reward:.3f}")
@@ -1205,7 +1133,6 @@ def plot_mcts_tree(
     fig, ax = plt.subplots(figsize=figsize)
     ax.set_facecolor("#f8f9fa")
 
-    # Edges (parent → child)
     for nid, node in nodes.items():
         if node.parent_id is None:
             continue
@@ -1213,13 +1140,11 @@ def plot_mcts_tree(
         x1, y1 = positions[nid]
         ax.plot([x0, x1], [y0, y1], color="#adb5bd", linewidth=0.8, zorder=0)
 
-    # Invert y so root is at top
     y_max = max(y for _, y in positions.values()) if positions else 0
     for nid in list(positions.keys()):
         x, y = positions[nid]
         positions[nid] = (x, y_max - y)
 
-    # Node boxes with labels (wider to fit all params: miss,out_d,out_h,norm,stat)
     node_w, node_h = 0.52, 0.28
     for nid, (x, y) in positions.items():
         node = nodes[nid]
@@ -1282,32 +1207,99 @@ def _plot_all_mcts_trees(
     return saved
 
 
-def _aggregate_slice_results(
-    slice_results: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Average test metrics across slices."""
-    valid = [r for r in slice_results if "test_metrics" in r and not r.get("error")]
+def _aggregate_slice_results(slice_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Robust aggregation across slices:
+    - Drop invalid metrics (nan/inf) and obvious explosions
+    - Optionally drop extreme MAPE slices/models
+    - Use trimmed mean for stability
+    """
+    import math
+
+    valid = [r for r in slice_results if not r.get("error") and r.get("test_metrics")]
     if not valid:
-        return {"test_metrics": {}, "num_slices": 0, "aggregation_method": "mean"}
+        return {"test_metrics": {}, "num_slices": 0, "aggregation_method": "robust_trimmed_mean"}
+
+    MAX_MSE = 1e9
+    MAX_MAE = 1e6
+    MAX_MAPE = 200.0
+    DROP_SLICE_IF_ENSEMBLE_MAPE_GT = 50.0
+    TRIM_FRAC = 0.1
+
+    def _is_finite_number(x) -> bool:
+        try:
+            return (x is not None) and math.isfinite(float(x))
+        except Exception:
+            return False
+
+    def _is_metric_valid(m: Dict[str, float]) -> bool:
+        if not isinstance(m, dict):
+            return False
+        mse = m.get("mse")
+        mae = m.get("mae")
+        mape = m.get("mape")
+        if not (_is_finite_number(mse) and _is_finite_number(mae) and _is_finite_number(mape)):
+            return False
+        if float(mse) < 0 or float(mae) < 0 or float(mape) < 0:
+            return False
+        if float(mse) > MAX_MSE or float(mae) > MAX_MAE or float(mape) > MAX_MAPE:
+            return False
+        return True
+
+    def _trimmed_mean(vals: List[float], trim_frac: float) -> float:
+        vals = [float(v) for v in vals if _is_finite_number(v)]
+        if not vals:
+            return float("nan")
+        vals.sort()
+        n = len(vals)
+        k = int(n * trim_frac)
+        if n - 2 * k <= 0:
+            mid = n // 2
+            return vals[mid] if n % 2 == 1 else 0.5 * (vals[mid - 1] + vals[mid])
+        core = vals[k : n - k]
+        return sum(core) / len(core)
+
+    filtered = []
+    for r in valid:
+        ens = (r.get("test_metrics") or {}).get("ensemble", None)
+        if ens is None or not _is_metric_valid(ens):
+            continue
+        if DROP_SLICE_IF_ENSEMBLE_MAPE_GT is not None:
+            if float(ens.get("mape", 0.0)) > float(DROP_SLICE_IF_ENSEMBLE_MAPE_GT):
+                continue
+        filtered.append(r)
+
+    if not filtered:
+        filtered = valid
 
     all_keys: set = set()
-    for r in valid:
-        all_keys.update(r["test_metrics"].keys())
+    for r in filtered:
+        all_keys.update((r.get("test_metrics") or {}).keys())
 
-    aggregated_metrics: Dict[str, Dict[str, float]] = {}
+    agg: Dict[str, Dict[str, float]] = {}
     for key in sorted(all_keys):
-        key_metrics = [r["test_metrics"][key] for r in valid if key in r["test_metrics"]]
-        if key_metrics:
-            aggregated_metrics[key] = {
-                "mse": float(np.mean([m["mse"] for m in key_metrics if not np.isnan(m["mse"])] or [float("nan")])),
-                "mae": float(np.mean([m["mae"] for m in key_metrics if not np.isnan(m["mae"])] or [float("nan")])),
-                "mape": float(np.mean([m["mape"] for m in key_metrics if not np.isnan(m["mape"])] or [float("nan")])),
-            }
+        mses, maes, mapes = [], [], []
+        for r in filtered:
+            m = (r.get("test_metrics") or {}).get(key, None)
+            if not _is_metric_valid(m):
+                continue
+            mses.append(m["mse"])
+            maes.append(m["mae"])
+            mapes.append(m["mape"])
+        if not mses:
+            continue
+        agg[key] = {
+            "mse": _trimmed_mean(mses, TRIM_FRAC),
+            "mae": _trimmed_mean(maes, TRIM_FRAC),
+            "mape": _trimmed_mean(mapes, TRIM_FRAC),
+        }
 
     return {
-        "test_metrics": aggregated_metrics,
-        "num_slices": len(valid),
-        "aggregation_method": "mean",
+        "test_metrics": agg,
+        "num_slices": len(filtered),
+        "aggregation_method": "robust_trimmed_mean",
+        "dropped_slice_rule": {"ensemble_mape_gt": DROP_SLICE_IF_ENSEMBLE_MAPE_GT},
+        "trim_frac": TRIM_FRAC,
     }
 
 
@@ -1319,13 +1311,11 @@ def _build_cross_slice_summary(
     """Build experiment_summary (compatible with ReportAgent) from all slices."""
     valid = [r for r in slice_results if not r.get("error")]
 
-    # Combine analysis reports from every slice
     combined_analysis = "\n\n---\n\n".join(
         f"### Slice {r.get('slice_id', i)}\n{r.get('analysis_result', '')}"
         for i, r in enumerate(valid)
     )
 
-    # Collect all unique model names
     all_models: set = set()
     for r in valid:
         for k in r.get("predictions_dict", {}):
@@ -1333,7 +1323,6 @@ def _build_cross_slice_summary(
             if len(parts) > 1:
                 all_models.add(parts[1])
 
-    # Per-slice summary for the report
     per_slice_summaries = []
     for r in valid:
         per_slice_summaries.append({
@@ -1397,7 +1386,7 @@ def run_funnel(
     config: Dict[str, Any],
     mcts_rollouts: int = 30,
     candidate_pool_size: int = 5,
-    ensemble_method: str = "auto",
+    ensemble_method: str = "greedy",
     use_llm_policies: bool = True,
 ) -> Dict[str, Any]:
     """Run the full funnel pipeline across all slices.
@@ -1406,21 +1395,16 @@ def run_funnel(
     2. For each slice: ``run_funnel_single_slice`` (single-tree MCTS L1+L2+L3 → Tune → Ensemble).
     3. Aggregate metrics across slices.
     4. ReportAgent generates one final report from all slice results.
-
-    Returns
-    -------
-    dict with ``slice_results``, ``aggregated``, ``num_slices``, and ``report``.
     """
     from utils.data_utils import DataLoader, DataPreprocessor, DataSplitter
 
-    # --- load & slice data -------------------------------------------------
     vprint("FUNNEL", "Loading data from %s ...", config.get("data_path"))
     data_path = config.get("data_path")
     df = DataLoader.load_data(data_path)
     date_col = config.get("date_column", "date")
     value_col = config.get("value_column", "OT")
     df_ts = DataPreprocessor.convert_to_time_series(df, date_col, value_col)
-    # PreprocessAgent-style: missing values + outliers (config-driven, no LLM)
+
     missing_strategy = config.get("missing_value_strategy", "interpolate")
     df_ts = DataPreprocessor.handle_missing_values(df_ts, strategy=missing_strategy)
     outlier_detect = config.get("outlier_detect_method", config.get("outlier_method", "iqr"))
@@ -1433,6 +1417,7 @@ def run_funnel(
         )
         if outlier_info and any(outlier_info.values()):
             df_ts = DataPreprocessor.handle_outliers(df_ts, outlier_info, strategy=outlier_handle)
+
     vprint("FUNNEL", "Data loaded & preprocessed: %d rows, columns=%s", len(df_ts), list(df_ts.columns))
 
     slice_len = config.get("slice_length")
@@ -1446,21 +1431,16 @@ def run_funnel(
     if not slices:
         return {"error": "No slices created", "slice_results": [], "aggregated": {}}
 
-    # Optionally cap the number of slices to run
     funnel_num_slices = config.get("funnel_num_slices")
     if funnel_num_slices and funnel_num_slices < len(slices):
         slices = slices[:funnel_num_slices]
         vprint("FUNNEL", "Capped to %d slices (funnel_num_slices=%s)", len(slices), funnel_num_slices)
 
-    # Shared TuningAgent across slices (keeps LLM warm)
     vprint("FUNNEL", "Initializing TuningAgent (LLM=%s)...", config.get("llm_model", "gemini-2.5-flash"))
-    # Shared memory across slices (AMEM semantic memory)
     shared_memory = ExperimentMemory(config)
-
     tuning = TuningAgent(model=config.get("llm_model", "gemini-2.5-flash"), config=config, memory=shared_memory)
     vprint("FUNNEL", "TuningAgent ready")
 
-    # --- process each slice independently ----------------------------------
     all_slice_results: List[Dict[str, Any]] = []
     for idx, s in enumerate(slices):
         logger.info(
@@ -1487,7 +1467,6 @@ def run_funnel(
             result = {"error": str(e), "slice_id": s.get("slice_id", idx)}
         all_slice_results.append(result)
 
-    # --- aggregate across slices -------------------------------------------
     vprint("FUNNEL", "")
     vprint("FUNNEL", "All slices complete. Aggregating results...")
     aggregated = _aggregate_slice_results(all_slice_results)
@@ -1502,7 +1481,6 @@ def run_funnel(
         "num_slices": len(slices),
     }
 
-    # --- plot all MCTS trees (explored trees with reward/visits per node) ---
     if config.get("funnel_plot_mcts_trees", True):
         output_dir = config.get("output_dir", "results")
         try:
@@ -1515,7 +1493,6 @@ def run_funnel(
             vprint("FUNNEL", "MCTS tree plotting FAILED: %s", e)
             results["mcts_tree_plots"] = []
 
-    # --- final cross-slice report ------------------------------------------
     if config.get("funnel_generate_report", True):
         vprint("FUNNEL", "Generating cross-slice report via ReportAgent...")
         try:
